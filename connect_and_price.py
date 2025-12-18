@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Kalshi Connection and Pricing Script
 
@@ -12,9 +13,31 @@ The "Implied Ask" Rule:
 """
 
 import os
+import sys
+from pathlib import Path
+
+# Verify required packages are available (check if we're using venv)
+try:
+    import pydantic
+except ImportError:
+    _script_dir = Path(__file__).parent.resolve()
+    _venv_python = _script_dir / "venv" / "bin" / "python3"
+    print("❌ ERROR: Required packages not found!")
+    print(f"   Current Python: {sys.executable}")
+    print("\n💡 SOLUTION: Activate the venv first:")
+    print("   source venv/bin/activate")
+    print("   python3 connect_and_price.py")
+    print("\n   OR use the venv's Python directly:")
+    if _venv_python.exists():
+        print(f"   {_venv_python} connect_and_price.py")
+    else:
+        print("   ./venv/bin/python3 connect_and_price.py")
+    sys.exit(1)
+
+import json
 import json
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from pydantic import ValidationError
 from kalshi_python_sync import KalshiClient, Configuration
 from kalshi_python_sync.exceptions import (
@@ -29,6 +52,7 @@ from kalshi_python_sync.exceptions import (
 # ==========================================
 KEY_ID = "0ac60c80-d575-480e-979b-aa5050a61c1b"  # Replace with your actual Kalshi API Key ID
 KEY_FILE_PATH = Path("My_First_API_Key.key")  # RSA PEM format private key file
+MIN_DAILY_VOLUME = 100000  # $1000 in cents - minimum 24-hour volume to filter markets
 
 
 def load_private_key_pem(key_file_path: Path) -> str:
@@ -119,6 +143,176 @@ def extract_orderbook_prices(
     return (best_yes_bid, best_yes_ask, best_no_bid, best_no_ask)
 
 
+def scan_series_markets(client: KalshiClient, series_ticker: str, min_volume: int = 100000) -> List:
+    """
+    Scan all markets in a series with volume filtering and pagination support.
+    
+    Args:
+        client: Authenticated KalshiClient instance
+        series_ticker: Series ticker to filter by (e.g., "KXFEDDECISION")
+        min_volume: Minimum 24-hour volume in cents (default: 100000 = $1000)
+        
+    Returns:
+        List of Market objects that meet the volume criteria
+    """
+    all_markets = []
+    cursor = None
+    
+    print(f"--- 🔍 SCANNING MARKETS IN SERIES: {series_ticker} (MIN VOLUME: ${min_volume/100:.2f}) ---")
+    
+    while True:
+        try:
+            if cursor:
+                markets_response = client.get_markets(
+                    series_ticker=series_ticker,
+                    status="open",
+                    limit=1000,  # Max per page
+                    cursor=cursor
+                )
+            else:
+                markets_response = client.get_markets(
+                    series_ticker=series_ticker,
+                    status="open",
+                    limit=1000
+                )
+        except ApiException as e:
+            print(f"⚠️  API error fetching markets: {e}")
+            break
+        
+        if not markets_response.markets:
+            break
+        
+        # Filter by volume
+        filtered_markets = [
+            m for m in markets_response.markets
+            if m.volume_24h >= min_volume
+        ]
+        all_markets.extend(filtered_markets)
+        
+        print(f"   Found {len(filtered_markets)} markets meeting volume criteria (page total: {len(markets_response.markets)})")
+        
+        # Check if there are more pages
+        cursor = markets_response.cursor
+        if not cursor or len(markets_response.markets) < 1000:
+            break
+    
+    print(f"✅ Total qualifying markets: {len(all_markets)}")
+    return all_markets
+
+
+def process_market_orderbook(client: KalshiClient, ticker: str, market_data=None):
+    """
+    Retrieve and process orderbook data for a single market.
+    Preserves the existing orderbook retrieval logic including raw HTTP fallback.
+    
+    Args:
+        client: Authenticated KalshiClient instance
+        ticker: Market ticker
+        market_data: Optional Market object (if already fetched)
+        
+    Returns:
+        Tuple of (price_data, market_data) or (None, None) if insufficient data
+    """
+    yes_bids = None
+    no_bids = None
+    yes_asks = None
+    no_asks = None
+    
+    # Get market data if not provided
+    if market_data is None:
+        try:
+            market_response = client.get_market(ticker)
+            market_data = market_response.market
+        except Exception as e:
+            print(f"   ⚠️  Could not retrieve market data: {e}")
+            market_data = None
+    
+    try:
+        orderbook_response = client.get_market_orderbook(ticker)
+        orderbook = orderbook_response.orderbook
+        
+        # Extract Yes and No bids
+        # Note: orderbook uses 'var_true' (aliased as "true") for Yes bids
+        # and 'var_false' (aliased as "false") for No bids
+        yes_bids = orderbook.var_true  # Yes bids: [[price, quantity], ...]
+        no_bids = orderbook.var_false  # No bids: [[price, quantity], ...]
+    except ValidationError:
+        # Handle Pydantic validation error - API returns integers where strings expected
+        # for yes_dollars/no_dollars, but we only need var_true/var_false
+        # Make a direct HTTP request to bypass validation
+        # Construct the full URL - resource path is /markets/{ticker}/orderbook
+        # and base path already includes /trade-api/v2
+        resource_path = f"/markets/{ticker}/orderbook"
+        full_url = f"{client.configuration._base_path}{resource_path}"
+        
+        # Use client's call_api method which handles URL construction and auth automatically
+        # Note: call_api will add Kalshi auth headers using the url parameter
+        response = client.call_api(
+            method="GET",
+            url=full_url,
+            header_params={}
+        )
+        
+        # Read the response data (required for RESTResponse objects)
+        response_data = response.read()
+        
+        # Check response status
+        if response.status != 200:
+            raise ApiException(
+                http_resp=response,
+                body=response_data.decode('utf-8') if isinstance(response_data, bytes) else str(response_data)
+            )
+        
+        # Decode response data - handle both bytes and already-decoded strings
+        if isinstance(response_data, bytes):
+            response_text = response_data.decode('utf-8')
+        elif isinstance(response_data, str):
+            response_text = response_data
+        else:
+            response_text = str(response_data)
+        
+        # Strip any whitespace that might cause JSON parsing issues
+        response_text = response_text.strip()
+        
+        # Parse raw JSON response
+        try:
+            raw_json = json.loads(response_text)
+        except json.JSONDecodeError as e:
+            # Debug: print first 200 chars if JSON parsing fails
+            print(f"   ⚠️  JSON decode error. Response preview: {response_text[:200]}")
+            raise
+        
+        orderbook_data = raw_json.get('orderbook', {})
+        
+        # Raw JSON uses 'yes' and 'no', not 'true' and 'false'
+        yes_bids = orderbook_data.get('yes')  # Raw JSON uses "yes"
+        no_bids = orderbook_data.get('no')  # Raw JSON uses "no"
+        
+        # Check if there are ask fields (maybe 'yes_asks' or similar)
+        # Also check the full raw JSON for any ask-related fields
+        yes_asks = (orderbook_data.get('yes_asks') or 
+                   orderbook_data.get('yes_ask') or 
+                   orderbook_data.get('asks_yes') or
+                   raw_json.get('yes_asks') or
+                   raw_json.get('yes_ask'))
+        no_asks = (orderbook_data.get('no_asks') or 
+                  orderbook_data.get('no_ask') or 
+                  orderbook_data.get('asks_no') or
+                  raw_json.get('no_asks') or
+                  raw_json.get('no_ask'))
+    
+    # Use market data for asks if orderbook doesn't have them
+    if not yes_asks and market_data and hasattr(market_data, 'yes_ask'):
+        yes_asks = [[market_data.yes_ask, 0]]  # Convert to list format
+    if not no_asks and market_data and hasattr(market_data, 'no_ask'):
+        no_asks = [[market_data.no_ask, 0]]  # Convert to list format
+    
+    # Extract actual bid and ask prices
+    price_data = extract_orderbook_prices(yes_bids, no_bids, yes_asks, no_asks)
+    
+    return price_data, market_data
+
+
 def main():
     """
     Main execution function: authenticate, fetch market, get orderbook, calculate spread.
@@ -148,273 +342,68 @@ def main():
         client.kalshi_auth = KalshiAuth(KEY_ID, private_key_pem)
         print("✅ Authentication configured")
         
-        # Fetch "Fed decision in January?" market - specifically January 2026
-        print("\n--- 🔍 FETCHING FED DECISION JANUARY 2026 MARKET ---")
+        # Scan all markets in KXFEDDECISION series with volume filtering
+        print(f"\n--- 🔍 SCANNING ALL MARKETS IN KXFEDDECISION SERIES ---")
+        qualifying_markets = scan_series_markets(client, "KXFEDDECISION", MIN_DAILY_VOLUME)
         
-        import time
-        from datetime import datetime
+        if not qualifying_markets:
+            print(f"⚠️  No markets found with volume >= ${MIN_DAILY_VOLUME/100:.2f}")
+            return
         
-        # Calculate Unix timestamps for January 2026
-        # Fed meeting is typically around January 28-29, 2026
-        jan_2026_start = int(datetime(2026, 1, 1, 0, 0, 0).timestamp())
-        jan_2026_end = int(datetime(2026, 1, 31, 23, 59, 59).timestamp())
+        # Process each qualifying market
+        print(f"\n--- 📖 PROCESSING ORDERBOOKS FOR {len(qualifying_markets)} MARKETS ---")
+        success_count = 0
+        error_count = 0
         
-        target_market = None
-        ticker = None
-        
-        # Strategy 1: Try direct ticker lookups (common formats)
-        possible_tickers = [
-            "KXFEDDECISION-26JAN",
-            "KXFEDDECISION-2026JAN",
-            "KXFEDDECISION-JAN26",
-            "KXFEDDECISION-JAN2026",
-            "KXFEDDECISION-26JAN-H0",  # Hike 0bps variant
-            "KXFEDDECISION-26JAN-T0",  # Target 0bps variant
-        ]
-        
-        for possible_ticker in possible_tickers:
+        for market in qualifying_markets:
+            ticker = market.ticker
+            print(f"\n{'='*60}")
+            print(f"MARKET: {ticker}")
+            print(f"TITLE: {market.title}")
+            print(f"VOLUME (24h): ${market.volume_24h/100:.2f}")
+            print(f"{'='*60}")
+            
             try:
-                market_response = client.get_market(possible_ticker)
-                target_market = market_response.market
-                ticker = possible_ticker
-                # Verify it's actually 2026
-                if "2026" in target_market.title or "26" in target_market.ticker:
-                    print(f"✅ Found market by ticker: {target_market.title}")
-                    print(f"   Ticker: {ticker}")
-                    break
-                else:
-                    target_market = None  # Reset if not 2026
-            except (NotFoundException, ApiException):
+                # Get orderbook for this market
+                price_data, market_data = process_market_orderbook(client, ticker, market)
+                
+                if price_data is None:
+                    print(f"❌ ERROR: Insufficient orderbook data for {ticker}")
+                    if market_data:
+                        if not hasattr(market_data, 'yes_bid') or market_data.yes_bid is None:
+                            print("   -> No Yes bids available")
+                        if not hasattr(market_data, 'no_bid') or market_data.no_bid is None:
+                            print("   -> No No bids available")
+                    error_count += 1
+                    continue
+                
+                best_yes_bid, best_yes_ask, best_no_bid, best_no_ask = price_data
+                
+                # Calculate spreads
+                yes_spread = best_yes_ask - best_yes_bid if best_yes_ask is not None else None
+                no_spread = best_no_ask - best_no_bid if best_no_ask is not None else None
+                
+                # Print formatted output
+                print(f"\n--- 💰 MARKET PRICING (ACTUAL ORDERBOOK DATA) ---")
+                print(f"   Yes: Bid {best_yes_bid:.2f}¢ | Ask {best_yes_ask:.2f}¢ | Spread {yes_spread:.2f}¢" if best_yes_ask else f"   Yes: Bid {best_yes_bid:.2f}¢ | Ask N/A")
+                print(f"   No:  Bid {best_no_bid:.2f}¢ | Ask {best_no_ask:.2f}¢ | Spread {no_spread:.2f}¢" if best_no_ask else f"   No:  Bid {best_no_bid:.2f}¢ | Ask N/A")
+                print(f"\nMARKET: {ticker}")
+                print(f"  YES: BID {best_yes_bid:.2f}¢ | ASK {best_yes_ask:.2f}¢ | SPREAD {yes_spread:.2f}¢" if best_yes_ask else f"  YES: BID {best_yes_bid:.2f}¢ | ASK N/A")
+                print(f"  NO:  BID {best_no_bid:.2f}¢ | ASK {best_no_ask:.2f}¢ | SPREAD {no_spread:.2f}¢" if best_no_ask else f"  NO:  BID {best_no_bid:.2f}¢ | ASK N/A")
+                
+                success_count += 1
+                
+            except Exception as e:
+                print(f"❌ ERROR processing {ticker}: {e}")
+                error_count += 1
                 continue
         
-        # Strategy 2: Use timestamp filters to find January 2026 markets
-        if target_market is None:
-            print(f"   ⚠️  Direct ticker lookup failed, searching with timestamp filters...")
-            # Use min_close_ts and max_close_ts to filter for January 2026
-            # Note: min_close_ts/max_close_ts work with status='open' or empty status
-            markets_response = client.get_markets(
-                series_ticker="KXFEDDECISION",
-                status="open",
-                min_close_ts=jan_2026_start,
-                max_close_ts=jan_2026_end,
-                limit=100
-            )
-            
-            if markets_response.markets and len(markets_response.markets) > 0:
-                # Filter for January in title/ticker
-                jan_2026_markets = [
-                    m for m in markets_response.markets 
-                    if ("january" in m.title.lower() or "jan" in m.title.lower() or "jan" in m.ticker.lower())
-                ]
-                
-                if jan_2026_markets:
-                    # Prefer "maintains rate" or "0bps" markets (most liquid)
-                    maintains_markets = [
-                        m for m in jan_2026_markets 
-                        if "maintain" in m.title.lower() or "0bps" in m.title.lower() or "h0" in m.ticker.lower() or "t0" in m.ticker.lower()
-                    ]
-                    if maintains_markets:
-                        target_market = maintains_markets[0]
-                    else:
-                        target_market = jan_2026_markets[0]
-                    ticker = target_market.ticker
-                    print(f"✅ Found January 2026 market: {target_market.title}")
-                    print(f"   Ticker: {ticker}")
-                else:
-                    print(f"   ⚠️  Found {len(markets_response.markets)} markets in Jan 2026 timeframe, but none match 'January' filter")
-                    print(f"   Showing first few markets:")
-                    for m in markets_response.markets[:5]:
-                        print(f"     - {m.ticker}: {m.title} (closes: {m.close_time})")
-                    if markets_response.markets:
-                        target_market = markets_response.markets[0]
-                        ticker = target_market.ticker
-                        print(f"   Using first market: {target_market.title}")
-            else:
-                # Strategy 3: Fallback - search without timestamp filter and filter manually
-                print(f"   ⚠️  Timestamp filter returned no results, trying broader search...")
-                markets_response = client.get_markets(
-                    series_ticker="KXFEDDECISION",
-                    status="open",
-                    limit=200
-                )
-                
-                if not markets_response.markets or len(markets_response.markets) == 0:
-                    print("❌ ERROR: No open Fed Decision markets found in KXFEDDECISION series")
-                    return
-                
-                # Filter for January 2026 markets specifically
-                jan_2026_markets = [
-                    m for m in markets_response.markets 
-                    if (("2026" in m.title or "26" in m.ticker) 
-                        and ("january" in m.title.lower() or "jan" in m.title.lower() or "jan" in m.ticker.lower()))
-                ]
-                
-                if jan_2026_markets:
-                    # Prefer "maintains rate" or "0bps" markets (most liquid)
-                    maintains_markets = [
-                        m for m in jan_2026_markets 
-                        if "maintain" in m.title.lower() or "0bps" in m.title.lower() or "h0" in m.ticker.lower() or "t0" in m.ticker.lower()
-                    ]
-                    if maintains_markets:
-                        target_market = maintains_markets[0]
-                    else:
-                        target_market = jan_2026_markets[0]
-                    ticker = target_market.ticker
-                    print(f"✅ Found January 2026 market: {target_market.title}")
-                    print(f"   Ticker: {ticker}")
-                else:
-                    print("❌ ERROR: No January 2026 markets found in KXFEDDECISION series")
-                    print(f"   Available markets (first 10):")
-                    for m in markets_response.markets[:10]:
-                        print(f"     - {m.ticker}: {m.title}")
-                    return
-        
-        if target_market is None:
-            print("❌ ERROR: Could not find January 2026 market")
-            return
-        
-        # Get orderbook for the selected market
-        print(f"\n--- 📖 RETRIEVING ORDERBOOK FOR {ticker} ---")
-        yes_bids = None
-        no_bids = None
-        yes_asks = None
-        no_asks = None
-        
-        # Also get market data which may have ask prices
-        market_data = None
-        try:
-            market_response = client.get_market(ticker)
-            market_data = market_response.market
-            print(f"   ✅ Retrieved market data (has yes_ask: {hasattr(market_data, 'yes_ask')}, no_ask: {hasattr(market_data, 'no_ask')})")
-        except Exception as e:
-            print(f"   ⚠️  Could not retrieve market data: {e}")
-        
-        try:
-            orderbook_response = client.get_market_orderbook(ticker)
-            orderbook = orderbook_response.orderbook
-            
-            # Extract Yes and No bids
-            # Note: orderbook uses 'var_true' (aliased as "true") for Yes bids
-            # and 'var_false' (aliased as "false") for No bids
-            yes_bids = orderbook.var_true  # Yes bids: [[price, quantity], ...]
-            no_bids = orderbook.var_false  # No bids: [[price, quantity], ...]
-        except ValidationError:
-            # Handle Pydantic validation error - API returns integers where strings expected
-            # for yes_dollars/no_dollars, but we only need var_true/var_false
-            # Make a direct HTTP request to bypass validation
-            print("   ⚠️  Validation warning: Parsing orderbook from raw HTTP response...")
-            
-            # Construct the full URL - resource path is /markets/{ticker}/orderbook
-            # and base path already includes /trade-api/v2
-            resource_path = f"/markets/{ticker}/orderbook"
-            full_url = f"{client.configuration._base_path}{resource_path}"
-            
-            # Use client's call_api method which handles URL construction and auth automatically
-            # Note: call_api will add Kalshi auth headers using the url parameter
-            response = client.call_api(
-                method="GET",
-                url=full_url,
-                header_params={}
-            )
-            
-            # Read the response data (required for RESTResponse objects)
-            response_data = response.read()
-            
-            # Check response status
-            if response.status != 200:
-                raise ApiException(
-                    http_resp=response,
-                    body=response_data.decode('utf-8') if isinstance(response_data, bytes) else str(response_data)
-                )
-            
-            # Decode response data - handle both bytes and already-decoded strings
-            if isinstance(response_data, bytes):
-                response_text = response_data.decode('utf-8')
-            elif isinstance(response_data, str):
-                response_text = response_data
-            else:
-                response_text = str(response_data)
-            
-            # Strip any whitespace that might cause JSON parsing issues
-            response_text = response_text.strip()
-            
-            # Parse raw JSON response
-            try:
-                raw_json = json.loads(response_text)
-            except json.JSONDecodeError as e:
-                # Debug: print first 200 chars if JSON parsing fails
-                print(f"   ⚠️  JSON decode error. Response preview: {response_text[:200]}")
-                raise
-            
-            orderbook_data = raw_json.get('orderbook', {})
-            # Debug: Show all keys in orderbook to see what's available
-            print(f"   🔍 DEBUG: Orderbook keys: {list(orderbook_data.keys())}")
-            
-            # Raw JSON uses 'yes' and 'no', not 'true' and 'false'
-            yes_bids = orderbook_data.get('yes')  # Raw JSON uses "yes"
-            no_bids = orderbook_data.get('no')  # Raw JSON uses "no"
-            
-            # Check if there are ask fields (maybe 'yes_asks' or similar)
-            # Also check the full raw JSON for any ask-related fields
-            yes_asks = (orderbook_data.get('yes_asks') or 
-                       orderbook_data.get('yes_ask') or 
-                       orderbook_data.get('asks_yes') or
-                       raw_json.get('yes_asks') or
-                       raw_json.get('yes_ask'))
-            no_asks = (orderbook_data.get('no_asks') or 
-                      orderbook_data.get('no_ask') or 
-                      orderbook_data.get('asks_no') or
-                      raw_json.get('no_asks') or
-                      raw_json.get('no_ask'))
-            
-            # Debug: Show raw orderbook data
-            if yes_bids and len(yes_bids) > 0:
-                print(f"   🔍 DEBUG: First Yes bid entry: {yes_bids[0]} (lowest)")
-                print(f"   🔍 DEBUG: Last Yes bid entry: {yes_bids[-1]} (highest/best)")
-            if no_bids and len(no_bids) > 0:
-                print(f"   🔍 DEBUG: First No bid entry: {no_bids[0]} (lowest)")
-                print(f"   🔍 DEBUG: Last No bid entry: {no_bids[-1]} (highest/best)")
-            if yes_asks:
-                print(f"   🔍 DEBUG: Yes asks found: {yes_asks}")
-            if no_asks:
-                print(f"   🔍 DEBUG: No asks found: {no_asks}")
-        
-        # Use market data for asks if orderbook doesn't have them
-        if not yes_asks and market_data and hasattr(market_data, 'yes_ask'):
-            yes_asks = [[market_data.yes_ask, 0]]  # Convert to list format
-            print(f"   ✅ Using market data for Yes ask: {market_data.yes_ask}¢")
-        if not no_asks and market_data and hasattr(market_data, 'no_ask'):
-            no_asks = [[market_data.no_ask, 0]]  # Convert to list format
-            print(f"   ✅ Using market data for No ask: {market_data.no_ask}¢")
-        
-        # Extract actual bid and ask prices
-        price_data = extract_orderbook_prices(yes_bids, no_bids, yes_asks, no_asks)
-        
-        if price_data is None:
-            print("❌ ERROR: Insufficient orderbook data")
-            if not yes_bids or len(yes_bids) == 0:
-                print("   -> No Yes bids available")
-                print(f"   -> This market ({ticker}) may have no Yes-side liquidity")
-                print("   -> Try a different market (e.g., 'maintains rate' markets are usually more liquid)")
-            if not no_bids or len(no_bids) == 0:
-                print("   -> No No bids available")
-            return
-        
-        best_yes_bid, best_yes_ask, best_no_bid, best_no_ask = price_data
-        
-        # Calculate spreads
-        yes_spread = best_yes_ask - best_yes_bid if best_yes_ask is not None else None
-        no_spread = best_no_ask - best_no_bid if best_no_ask is not None else None
-        
-        # Print formatted output
-        print(f"\n--- 💰 MARKET PRICING (ACTUAL ORDERBOOK DATA) ---")
-        print(f"   Yes: Bid {best_yes_bid:.2f}¢ | Ask {best_yes_ask:.2f}¢ | Spread {yes_spread:.2f}¢" if best_yes_ask else f"   Yes: Bid {best_yes_bid:.2f}¢ | Ask N/A")
-        print(f"   No:  Bid {best_no_bid:.2f}¢ | Ask {best_no_ask:.2f}¢ | Spread {no_spread:.2f}¢" if best_no_ask else f"   No:  Bid {best_no_bid:.2f}¢ | Ask N/A")
-        print(f"\nMARKET: {ticker}")
-        print(f"  YES: BID {best_yes_bid:.2f}¢ | ASK {best_yes_ask:.2f}¢ | SPREAD {yes_spread:.2f}¢" if best_yes_ask else f"  YES: BID {best_yes_bid:.2f}¢ | ASK N/A")
-        print(f"  NO:  BID {best_no_bid:.2f}¢ | ASK {best_no_ask:.2f}¢ | SPREAD {no_spread:.2f}¢" if best_no_ask else f"  NO:  BID {best_no_bid:.2f}¢ | ASK N/A")
-        
-        print("\n✅ SUCCESS: Connection and pricing verification complete")
+        # Summary
+        print(f"\n{'='*60}")
+        print(f"✅ SUCCESS: Processed {success_count} markets successfully")
+        if error_count > 0:
+            print(f"⚠️  ERRORS: {error_count} markets failed")
+        print(f"{'='*60}")
         
     except FileNotFoundError as e:
         print(f"\n{e}")
