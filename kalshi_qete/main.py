@@ -19,9 +19,14 @@ Usage:
     
     # Run continuous ingestion
     python kalshi_qete/main.py --continuous --interval 60
+    
+    # Run a trading strategy
+    python kalshi_qete/main.py --strategy macro_fed
+    python kalshi_qete/main.py --strategy structural_arb --top 50
 """
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
@@ -181,6 +186,66 @@ def show_db_stats():
         print(f"  Latest: {stats['latest_snapshot']}")
 
 
+# =============================================================================
+# STRATEGY RUNNERS
+# =============================================================================
+
+def run_macro_fed_strategy(z_threshold: float = 2.0, verbose: bool = False):
+    """
+    Run the Macro Fed Correlation Strategy.
+    
+    Correlates Treasury yields with Kalshi Fed markets.
+    """
+    from kalshi_qete.src.strategies.macro_fed import run_macro_fed_strategy as _run
+    
+    asyncio.run(_run(
+        key_id=config.KEY_ID,
+        key_file_path=str(config.KEY_FILE_PATH),
+        z_threshold=z_threshold,
+        verbose=verbose,
+    ))
+
+
+def run_structural_arb_strategy(top_n: int = 50, verbose: bool = False):
+    """
+    Run the Structural Arbitrage Strategy.
+    
+    Scans mutually exclusive events for mispricing.
+    """
+    from kalshi_qete.run_strategy import run_complete_scan_async
+    
+    asyncio.run(run_complete_scan_async(
+        top_n=top_n,
+        min_volume=100,
+        buy_threshold=98.0,
+        sell_threshold=102.0,
+        min_coverage=0.9,
+        min_event_volume=5000.0,
+        verbose=verbose,
+    ))
+
+
+AVAILABLE_STRATEGIES = {
+    "macro_fed": {
+        "fn": run_macro_fed_strategy,
+        "desc": "Treasury yield / Kalshi Fed rate correlation",
+    },
+    "structural_arb": {
+        "fn": run_structural_arb_strategy,
+        "desc": "Mutually exclusive event mispricing",
+    },
+}
+
+
+def list_strategies():
+    """List available strategies."""
+    print("\n" + "-" * 60)
+    print("Available Strategies")
+    print("-" * 60)
+    for name, info in AVAILABLE_STRATEGIES.items():
+        print(f"  {name}: {info['desc']}")
+
+
 def main():
     """Main entry point for QETE."""
     parser = argparse.ArgumentParser(
@@ -188,14 +253,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python kalshi_qete/main.py                          # Run demo
-  python kalshi_qete/main.py --event KXFEDCHAIRNOM-29 # Ingest event
-  python kalshi_qete/main.py --series KXHIGHNY        # Ingest series
-  python kalshi_qete/main.py --top-volume 50          # Ingest top 50
-  python kalshi_qete/main.py --stats                  # Show DB stats
+  python kalshi_qete/main.py                              # Run demo
+  python kalshi_qete/main.py --event KXFEDCHAIRNOM-29     # Ingest event
+  python kalshi_qete/main.py --series KXHIGHNY            # Ingest series
+  python kalshi_qete/main.py --top-volume 50              # Ingest top 50
+  python kalshi_qete/main.py --stats                      # Show DB stats
+  python kalshi_qete/main.py --strategy macro_fed         # Run Fed correlation
+  python kalshi_qete/main.py --strategy structural_arb    # Run arb scanner
+  python kalshi_qete/main.py --list-strategies            # List strategies
         """
     )
     
+    # Ingestion arguments
     parser.add_argument(
         "--event", "-e",
         help="Event ticker to ingest (e.g., KXFEDCHAIRNOM-29)"
@@ -231,6 +300,37 @@ Examples:
         action="store_true",
         help="Show database statistics"
     )
+    
+    # Strategy arguments
+    parser.add_argument(
+        "--strategy",
+        choices=list(AVAILABLE_STRATEGIES.keys()),
+        help="Run a trading strategy (macro_fed, structural_arb)"
+    )
+    parser.add_argument(
+        "--list-strategies",
+        action="store_true",
+        help="List available strategies"
+    )
+    parser.add_argument(
+        "--z-threshold",
+        type=float,
+        default=2.0,
+        help="Z-score threshold for macro_fed strategy (default: 2.0)"
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=50,
+        help="Number of top markets to scan for structural_arb (default: 50)"
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose output for strategies"
+    )
+    
+    # General arguments
     parser.add_argument(
         "--skip-verify",
         action="store_true",
@@ -238,6 +338,11 @@ Examples:
     )
     
     args = parser.parse_args()
+    
+    # Handle strategy list first
+    if args.list_strategies:
+        list_strategies()
+        return
     
     # Verify environment unless skipped
     if not args.skip_verify:
@@ -248,7 +353,19 @@ Examples:
             sys.exit(1)
     
     # Route to appropriate command
-    if args.stats:
+    if args.strategy:
+        # Run a trading strategy
+        if args.strategy == "macro_fed":
+            run_macro_fed_strategy(
+                z_threshold=args.z_threshold,
+                verbose=args.verbose,
+            )
+        elif args.strategy == "structural_arb":
+            run_structural_arb_strategy(
+                top_n=args.top,
+                verbose=args.verbose,
+            )
+    elif args.stats:
         show_db_stats()
     elif args.event:
         run_event_ingest(args.event)

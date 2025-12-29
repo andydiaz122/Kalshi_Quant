@@ -50,8 +50,15 @@ from kalshi_python_sync.exceptions import (
 # ==========================================
 # CONFIGURATION CONSTANTS
 # ==========================================
-KEY_ID = "0ac60c80-d575-480e-979b-aa5050a61c1b"  # Replace with your actual Kalshi API Key ID
-KEY_FILE_PATH = Path("My_First_API_Key.key")  # RSA PEM format private key file
+# Load API credentials from environment variables for security
+KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
+if not KEY_ID:
+    raise EnvironmentError(
+        "KALSHI_API_KEY_ID environment variable not set. "
+        "Export it before running: export KALSHI_API_KEY_ID='your-key-id'"
+    )
+
+KEY_FILE_PATH = Path(os.environ.get("KALSHI_KEY_FILE_PATH", "My_First_API_Key.key"))
 MIN_DAILY_VOLUME = 100000  # $1000 in cents - minimum 24-hour volume to filter markets
 
 

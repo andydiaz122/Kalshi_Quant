@@ -3,8 +3,14 @@ QETE Configuration Module
 
 Centralized configuration for the Quantitative Event Trading Engine.
 All API credentials, paths, and trading constants are managed here.
+
+Environment Variables:
+    KALSHI_API_KEY_ID: Your Kalshi API Key ID (UUID format) - REQUIRED
+    KALSHI_KEY_FILE_PATH: Path to RSA private key file (optional)
 """
 
+import os
+import warnings
 from pathlib import Path
 
 # ==============================================================================
@@ -24,12 +30,21 @@ LOGS_DIR = QETE_ROOT / "logs"
 # ==============================================================================
 # API CREDENTIALS
 # ==============================================================================
+# Load from environment variables for security
+# Set these before running:
+#   export KALSHI_API_KEY_ID='your-api-key-id'
+#   export KALSHI_KEY_FILE_PATH='/path/to/key.key'  (optional)
 
-# Kalshi API Key ID - Replace with your actual key ID
-KEY_ID = "0ac60c80-d575-480e-979b-aa5050a61c1b"
+KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
+if not KEY_ID:
+    warnings.warn(
+        "KALSHI_API_KEY_ID environment variable not set. "
+        "API calls will fail until this is configured.",
+        UserWarning
+    )
 
 # RSA private key file path (relative to project root)
-KEY_FILE_PATH = PROJECT_ROOT / "My_First_API_Key.key"
+KEY_FILE_PATH = Path(os.environ.get("KALSHI_KEY_FILE_PATH", str(PROJECT_ROOT / "My_First_API_Key.key")))
 
 # ==============================================================================
 # TRADING CONFIGURATION

@@ -61,6 +61,8 @@ class EventAnalysis:
         buy_arb_profit: Profit from buy arb (negative if no opportunity)
         sell_arb_profit: Profit from sell arb (negative if no opportunity)
         market_count: Number of markets in event
+        total_markets: Total markets in event (for coverage calculation)
+        aggregate_volume: Total 24h contract volume across all markets
     """
     event_ticker: str
     markets: List[MarketWithOrderbook]
@@ -70,6 +72,15 @@ class EventAnalysis:
     sell_arb_profit: float  # In cents (sum_bids - 100 - fees)
     market_count: int
     timestamp: datetime
+    total_markets: int = 0  # For coverage calculation
+    aggregate_volume: int = 0  # Total 24h contract volume
+    
+    @property
+    def coverage(self) -> float:
+        """Percentage of markets with valid pricing."""
+        if self.total_markets == 0:
+            return 0.0
+        return self.market_count / self.total_markets
     
     @property
     def has_buy_arb(self) -> bool:
@@ -86,11 +97,35 @@ class EventAnalysis:
         """True if any arbitrage opportunity exists."""
         return self.has_buy_arb or self.has_sell_arb
     
+    def is_high_quality(
+        self, 
+        min_coverage: float = 0.9, 
+        min_contracts: int = 10000
+    ) -> bool:
+        """
+        Check if opportunity meets quality thresholds.
+        
+        Args:
+            min_coverage: Minimum coverage ratio (default: 90%)
+            min_contracts: Minimum aggregate 24h contract volume (default: 10,000)
+            
+        Returns:
+            True if opportunity is high quality
+        """
+        if not self.has_opportunity:
+            return False
+        if self.coverage < min_coverage:
+            return False
+        if self.aggregate_volume < min_contracts:
+            return False
+        return True
+    
     def __str__(self) -> str:
         status = "ARB!" if self.has_opportunity else "No Arb"
         return (
             f"EventAnalysis({self.event_ticker}): {self.market_count} markets, "
-            f"Sum(Asks)={self.sum_yes_asks:.1f}¢, Sum(Bids)={self.sum_yes_bids:.1f}¢ "
+            f"Sum(Asks)={self.sum_yes_asks:.1f}¢, Sum(Bids)={self.sum_yes_bids:.1f}¢, "
+            f"Cov={self.coverage*100:.0f}%, Contracts={self.aggregate_volume:,} "
             f"[{status}]"
         )
 
@@ -176,8 +211,12 @@ class StructuralArbStrategy(Strategy):
         sum_yes_asks = 0.0
         sum_yes_bids = 0.0
         valid_markets = []
+        aggregate_volume = 0
         
         for market in markets:
+            # Accumulate volume from all markets (even without pricing)
+            aggregate_volume += getattr(market.market, 'volume_24h', 0) or 0
+            
             pricing = market.pricing
             
             # Skip markets without valid pricing
@@ -215,7 +254,9 @@ class StructuralArbStrategy(Strategy):
             buy_arb_profit=buy_arb_profit,
             sell_arb_profit=sell_arb_profit,
             market_count=len(valid_markets),
-            timestamp=datetime.now()
+            timestamp=datetime.now(),
+            total_markets=len(markets),  # All markets (for coverage)
+            aggregate_volume=aggregate_volume
         )
     
     def analyze_all_events(
@@ -770,6 +811,58 @@ class StructuralArbScanner:
             List of EventAnalysis where has_opportunity is True
         """
         return [a for a in self.last_analyses if a.has_opportunity]
+    
+    def get_high_quality_opportunities(
+        self,
+        min_coverage: float = 0.9,
+        min_contracts: int = 10000
+    ) -> List[EventAnalysis]:
+        """
+        Get only high-quality arbitrage opportunities.
+        
+        Filters by:
+        - Coverage >= min_coverage (default: 90%)
+        - Aggregate contract volume >= min_contracts (default: 10,000)
+        
+        This eliminates:
+        - Low coverage events (incomplete data, risky)
+        - Low volume events (capital traps, illiquid)
+        
+        Args:
+            min_coverage: Minimum coverage ratio
+            min_contracts: Minimum aggregate 24h contract volume
+            
+        Returns:
+            List of high-quality EventAnalysis
+        """
+        return [
+            a for a in self.last_analyses 
+            if a.is_high_quality(min_coverage, min_contracts)
+        ]
+    
+    def get_filtered_signal_groups(
+        self,
+        min_coverage: float = 0.9,
+        min_contracts: int = 10000
+    ) -> List[SignalGroup]:
+        """
+        Get signal groups only for high-quality opportunities.
+        
+        Args:
+            min_coverage: Minimum coverage ratio
+            min_contracts: Minimum aggregate 24h contract volume
+            
+        Returns:
+            List of SignalGroup for execution
+        """
+        hq_events = {
+            a.event_ticker 
+            for a in self.get_high_quality_opportunities(min_coverage, min_contracts)
+        }
+        
+        all_groups = self.get_signal_groups()
+        
+        return [g for g in all_groups if g.event_ticker in hq_events]
     
     def get_signals(self) -> List[Signal]:
         """

@@ -1,11 +1,22 @@
 """
 Configuration constants for Kalshi Quant trading system.
+
+Environment Variables Required:
+    KALSHI_API_KEY_ID: Your Kalshi API Key ID (UUID format)
+    KALSHI_KEY_FILE_PATH: Path to RSA private key file (optional, defaults to My_First_API_Key.key)
 """
+import os
 from pathlib import Path
 
-# API Authentication
-KEY_ID = "0ac60c80-d575-480e-979b-aa5050a61c1b"
-KEY_FILE_PATH = Path("My_First_API_Key.key")  # RSA PEM format private key file
+# API Authentication - Load from environment variables
+KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
+if not KEY_ID:
+    raise EnvironmentError(
+        "KALSHI_API_KEY_ID environment variable not set. "
+        "Please set it to your Kalshi API Key ID."
+    )
+
+KEY_FILE_PATH = Path(os.environ.get("KALSHI_KEY_FILE_PATH", "My_First_API_Key.key"))
 
 # Database Configuration
 DATABASE_PATH = "market_data.duckdb"

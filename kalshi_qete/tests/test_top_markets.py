@@ -22,7 +22,7 @@ from kalshi_qete import config
 from kalshi_qete.src.adapters.kalshi_adapter import KalshiAdapter
 
 
-def get_top_markets_by_volume(adapter: KalshiAdapter, n: int = 5):
+def get_top_markets_by_volume(adapter: KalshiAdapter, n: int = 25):
     """
     Fetch the top N markets by 24h trading volume.
     
@@ -59,7 +59,7 @@ def get_top_markets_by_volume(adapter: KalshiAdapter, n: int = 5):
 
 def main():
     print("=" * 70)
-    print("TOP 5 KALSHI MARKETS BY 24H VOLUME - ORDERBOOK TEST")
+    print("TOP 25 KALSHI MARKETS BY 24H VOLUME - ORDERBOOK TEST")
     print("=" * 70)
     
     # Create adapter
@@ -67,9 +67,9 @@ def main():
     adapter = KalshiAdapter(config.KEY_ID, config.KEY_FILE_PATH)
     print("✓ Connected\n")
     
-    # Get top 5 markets
-    print("Fetching top 5 markets by 24h volume...")
-    top_markets = get_top_markets_by_volume(adapter, n=5)
+    # Get top 25 markets
+    print("Fetching top 25 markets by 24h volume...")
+    top_markets = get_top_markets_by_volume(adapter, n=25)
     
     if not top_markets:
         print("✗ No markets found!")
@@ -82,7 +82,23 @@ def main():
         print("-" * 70)
         print(f"#{i} {market.ticker}")
         print(f"    Title:  {market.title}")
-        print(f"    Volume: ${market.volume_24h / 100:,.2f} (24h)")
+        
+        # Volume is CONTRACT COUNT (not cents!)
+        contracts_24h = market.volume_24h or 0
+        total_contracts = market.volume or 0
+        
+        # Estimate notional value using last_price or mid price
+        last_price = market.last_price or 0
+        yes_mid = ((market.yes_bid or 0) + (market.yes_ask or 0)) / 2
+        est_price = last_price if last_price > 0 else yes_mid
+        
+        # Notional = contracts × price (price is in cents, so divide by 100)
+        notional_24h = contracts_24h * (est_price / 100) if est_price > 0 else 0
+        
+        print(f"    24h Contracts: {contracts_24h:,}")
+        print(f"    24h Notional:  ${notional_24h:,.2f} (est. @ {est_price:.0f}¢)")
+        print(f"    Total Volume:  {total_contracts:,} contracts")
+        print(f"    Last Price:    {last_price}¢")
         print(f"    Status: {market.status}")
         
         # Get orderbook

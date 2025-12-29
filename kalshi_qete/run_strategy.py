@@ -127,28 +127,41 @@ def print_completeness_report(complete_events: dict, verbose: bool = False):
             print(f"    {et}: {data.markets_with_pricing}/{data.total_markets} ({data.completeness*100:.0f}%)")
 
 
-def print_event_analysis(analyses: list, complete_events: dict, verbose: bool = False):
-    """Print event analysis results."""
+def print_event_analysis(
+    analyses: list, 
+    complete_events: dict, 
+    verbose: bool = False,
+    min_coverage: float = 0.9,
+    min_contracts: int = 10000
+):
+    """Print event analysis results with quality filtering."""
     print(f"\n📈 ARBITRAGE ANALYSIS (Complete Data)")
     print("-" * 50)
     
     # Separate by opportunity type
     buy_opps = [a for a in analyses if a.has_buy_arb]
     sell_opps = [a for a in analyses if a.has_sell_arb]
+    
+    # Filter to high-quality opportunities (volume is contract count)
+    hq_buy = [a for a in buy_opps if a.is_high_quality(min_coverage, min_contracts)]
+    hq_sell = [a for a in sell_opps if a.is_high_quality(min_coverage, min_contracts)]
+    
+    low_quality = [a for a in (buy_opps + sell_opps) if not a.is_high_quality(min_coverage, min_contracts)]
+    
     close_to_buy = [a for a in analyses if not a.has_buy_arb and 98 <= a.sum_yes_asks < 103 and a.sum_yes_asks > 0]
     close_to_sell = [a for a in analyses if not a.has_sell_arb and 97 < a.sum_yes_bids <= 102]
     
-    # Print opportunities first
-    if buy_opps:
-        print(f"\n🚨 BUY ARBITRAGE OPPORTUNITIES ({len(buy_opps)}):")
-        print("   (Sum of YES asks < threshold → Buy ALL for guaranteed profit)")
-        for a in sorted(buy_opps, key=lambda x: x.sum_yes_asks):
+    # Print HIGH QUALITY opportunities (ACTIONABLE)
+    if hq_buy or hq_sell:
+        print(f"\n🏆 HIGH QUALITY OPPORTUNITIES (Coverage ≥{min_coverage*100:.0f}%, Contracts ≥{min_contracts:,})")
+        print("   ⚡ These are ACTIONABLE signals")
+        
+        for a in sorted(hq_buy, key=lambda x: x.sum_yes_asks):
             profit_pct = (100 - a.sum_yes_asks) / a.sum_yes_asks * 100 if a.sum_yes_asks > 0 else 0
-            event_data = complete_events.get(a.event_ticker)
-            completeness = f"({event_data.completeness*100:.0f}% coverage)" if event_data else ""
             
-            print(f"\n   🎯 {a.event_ticker} {completeness}")
-            print(f"      Markets: {a.market_count}")
+            print(f"\n   🎯 BUY ALL: {a.event_ticker}")
+            print(f"      Coverage: {a.coverage*100:.0f}% ({a.market_count}/{a.total_markets} markets)")
+            print(f"      24h Contracts: {a.aggregate_volume:,}")
             print(f"      Sum(Asks): {a.sum_yes_asks:.1f}¢")
             print(f"      Profit: {a.buy_arb_profit:.1f}¢ per contract ({profit_pct:.1f}%)")
             
@@ -156,36 +169,46 @@ def print_event_analysis(analyses: list, complete_events: dict, verbose: bool = 
                 print(f"      Breakdown:")
                 for m in a.markets:
                     ask = m.pricing.best_yes_ask if m.pricing else "N/A"
-                    print(f"        {m.market.ticker}: {ask}¢")
-    
-    if sell_opps:
-        print(f"\n🚨 SELL ARBITRAGE OPPORTUNITIES ({len(sell_opps)}):")
-        print("   (Sum of YES bids > threshold → Sell ALL for guaranteed profit)")
-        for a in sorted(sell_opps, key=lambda x: -x.sum_yes_bids):
+                    contracts = m.market.volume_24h or 0
+                    print(f"        {m.market.ticker}: {ask}¢ ({contracts:,} contracts)")
+        
+        for a in sorted(hq_sell, key=lambda x: -x.sum_yes_bids):
             profit_pct = (a.sum_yes_bids - 100) / 100 * 100
-            event_data = complete_events.get(a.event_ticker)
-            completeness = f"({event_data.completeness*100:.0f}% coverage)" if event_data else ""
             
-            print(f"\n   🎯 {a.event_ticker} {completeness}")
-            print(f"      Markets: {a.market_count}")
+            print(f"\n   🎯 SELL ALL: {a.event_ticker}")
+            print(f"      Coverage: {a.coverage*100:.0f}% ({a.market_count}/{a.total_markets} markets)")
+            print(f"      24h Contracts: {a.aggregate_volume:,}")
             print(f"      Sum(Bids): {a.sum_yes_bids:.1f}¢")
             print(f"      Profit: {a.sell_arb_profit:.1f}¢ per contract ({profit_pct:.1f}%)")
+    else:
+        print(f"\n   ✅ No high-quality arbitrage opportunities found")
+        print(f"   (Markets are efficiently priced or opportunities don't meet quality thresholds)")
     
-    if not buy_opps and not sell_opps:
-        print(f"\n   ✅ Markets are efficiently priced - no arbitrage found")
-        print(f"   (This is expected - real mispricings are rare)")
+    # Print LOW QUALITY opportunities (filtered out)
+    if low_quality:
+        print(f"\n⚠️ LOW QUALITY OPPORTUNITIES ({len(low_quality)}) - FILTERED OUT:")
+        for a in low_quality:
+            reason = []
+            if a.coverage < min_coverage:
+                reason.append(f"coverage {a.coverage*100:.0f}% < {min_coverage*100:.0f}%")
+            if a.aggregate_volume < min_contracts:
+                reason.append(f"contracts {a.aggregate_volume:,} < {min_contracts:,}")
+            
+            arb_type = "BUY" if a.has_buy_arb else "SELL"
+            profit = a.buy_arb_profit if a.has_buy_arb else a.sell_arb_profit
+            print(f"   ✗ {a.event_ticker}: {arb_type} ({profit:.1f}¢) - {', '.join(reason)}")
     
     # Print near-misses
     if close_to_buy:
         print(f"\n👀 CLOSE TO BUY ARB (98-103¢):")
-        for a in sorted(close_to_buy, key=lambda x: x.sum_yes_asks)[:10]:
-            gap = a.sum_yes_asks - 98  # Gap to threshold
+        for a in sorted(close_to_buy, key=lambda x: x.sum_yes_asks)[:5]:
+            gap = a.sum_yes_asks - 98
             print(f"   {a.event_ticker}: {a.sum_yes_asks:.1f}¢ ({a.market_count} mkts, need {gap:.1f}¢ drop)")
     
     if close_to_sell:
         print(f"\n👀 CLOSE TO SELL ARB (97-102¢):")
-        for a in sorted(close_to_sell, key=lambda x: -x.sum_yes_bids)[:10]:
-            gap = 102 - a.sum_yes_bids  # Gap to threshold
+        for a in sorted(close_to_sell, key=lambda x: -x.sum_yes_bids)[:5]:
+            gap = 102 - a.sum_yes_bids
             print(f"   {a.event_ticker}: {a.sum_yes_bids:.1f}¢ ({a.market_count} mkts, need {gap:.1f}¢ rise)")
 
 
@@ -251,6 +274,8 @@ def run_complete_scan(
     min_volume: int = 100,
     buy_threshold: float = 98.0,
     sell_threshold: float = 102.0,
+    min_coverage: float = 0.9,
+    min_event_contracts: int = 10000,
     verbose: bool = False
 ):
     """
@@ -260,17 +285,20 @@ def run_complete_scan(
     
     Args:
         top_n: Number of top markets to scan for event discovery
-        min_volume: Minimum 24h volume filter
+        min_volume: Minimum 24h contract volume filter for initial scan
         buy_threshold: Sum of asks below this triggers buy signal
         sell_threshold: Sum of bids above this triggers sell signal
+        min_coverage: Minimum coverage ratio for quality filter (default: 90%)
+        min_event_contracts: Minimum aggregate 24h contract volume (default: 10,000)
         verbose: Print detailed output
     """
     print_header()
     
     print(f"\nConfiguration:")
-    print(f"  Initial scan: Top {top_n} markets (min volume: {min_volume})")
+    print(f"  Initial scan: Top {top_n} markets (min contracts: {min_volume})")
     print(f"  Buy threshold: <{buy_threshold}¢ (trigger BUY ALL)")
     print(f"  Sell threshold: >{sell_threshold}¢ (trigger SELL ALL)")
+    print(f"  Quality filters: Coverage ≥{min_coverage*100:.0f}%, Contracts ≥{min_event_contracts:,}")
     print(f"  Mode: COMPLETE event data (no false positives)")
     
     # Initialize adapter
@@ -306,32 +334,49 @@ def run_complete_scan(
     # Print safe event discovery
     print_discovery_summary(scanner.complete_events, initial_market_count)
     print_completeness_report(scanner.complete_events, verbose=verbose)
-    print_event_analysis(analyses, scanner.complete_events, verbose=verbose)
+    print_event_analysis(
+        analyses, 
+        scanner.complete_events, 
+        verbose=verbose,
+        min_coverage=min_coverage,
+        min_contracts=min_event_contracts
+    )
     
-    # Generate and print signals
-    signal_groups = scanner.get_signal_groups()
-    print_signals(signal_groups)
+    # Generate signals only for HIGH QUALITY opportunities
+    hq_signal_groups = scanner.get_filtered_signal_groups(
+        min_coverage=min_coverage,
+        min_contracts=min_event_contracts
+    )
+    print_signals(hq_signal_groups)
     
     print_statistics(analyses)
     
     # Final summary
     print(f"\n" + "=" * 70)
-    opportunities = scanner.get_opportunities()
-    if opportunities:
+    hq_opportunities = scanner.get_high_quality_opportunities(min_coverage, min_event_contracts)
+    all_opportunities = scanner.get_opportunities()
+    
+    if hq_opportunities:
         total_profit = sum(
             a.buy_arb_profit if a.has_buy_arb else a.sell_arb_profit 
-            for a in opportunities
+            for a in hq_opportunities
         )
-        print(f"🎯 FOUND {len(opportunities)} REAL ARBITRAGE OPPORTUNITIES")
+        print(f"🏆 FOUND {len(hq_opportunities)} HIGH-QUALITY ARBITRAGE OPPORTUNITIES")
         print(f"   Total estimated profit: {total_profit:.1f}¢ per contract set")
-        print(f"\n   ⚠️  These are based on complete event data - verify before trading!")
+        print(f"\n   ✅ Quality filters passed (Coverage ≥{min_coverage*100:.0f}%, Contracts ≥{min_event_contracts:,})")
+        print(f"   📋 {len(hq_signal_groups)} signal groups ready for execution")
+    elif all_opportunities:
+        filtered_out = len(all_opportunities) - len(hq_opportunities)
+        print(f"⚠️  FOUND {len(all_opportunities)} OPPORTUNITIES - ALL FILTERED OUT")
+        print(f"   {filtered_out} opportunities failed quality filters")
+        print(f"   (Coverage <{min_coverage*100:.0f}% or Contracts <{min_event_contracts:,})")
     else:
         print(f"✅ NO ARBITRAGE OPPORTUNITIES FOUND")
         print(f"   Markets are efficiently priced (Sum ≈ 100¢)")
         print(f"   Analyzed {len(analyses)} events with complete data")
     print("=" * 70)
     
-    return scanner, analyses, signal_groups
+    return scanner, analyses, hq_signal_groups
 
 
 def main():
@@ -361,7 +406,7 @@ It will make many API calls (one per event discovered).
         "--min-volume",
         type=int,
         default=100,
-        help="Minimum 24h volume filter (default: 100)"
+        help="Minimum 24h contract volume filter (default: 100)"
     )
     parser.add_argument(
         "--buy-threshold",
@@ -374,6 +419,18 @@ It will make many API calls (one per event discovered).
         type=float,
         default=102.0,
         help="Sell arb threshold in cents (default: 102)"
+    )
+    parser.add_argument(
+        "--min-coverage",
+        type=float,
+        default=0.9,
+        help="Minimum coverage ratio for quality filter (default: 0.9 = 90%%)"
+    )
+    parser.add_argument(
+        "--min-event-contracts",
+        type=int,
+        default=10000,
+        help="Minimum aggregate 24h contract volume (default: 10000)"
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -389,6 +446,8 @@ It will make many API calls (one per event discovered).
             min_volume=args.min_volume,
             buy_threshold=args.buy_threshold,
             sell_threshold=args.sell_threshold,
+            min_coverage=args.min_coverage,
+            min_event_contracts=args.min_event_contracts,
             verbose=args.verbose
         )
     except KeyboardInterrupt:
